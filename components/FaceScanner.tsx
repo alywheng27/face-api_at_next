@@ -92,7 +92,9 @@ export default function FaceScanner() {
         });
 
         if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
+          stream.getTracks().forEach((t) => {
+            t.stop();
+          });
           return;
         }
 
@@ -118,7 +120,9 @@ export default function FaceScanner() {
       cancelled = true;
       const video = videoRef.current;
       if (video?.srcObject) {
-        (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+        (video.srcObject as MediaStream).getTracks().forEach((t) => {
+          t.stop();
+        });
       }
     };
   }, []);

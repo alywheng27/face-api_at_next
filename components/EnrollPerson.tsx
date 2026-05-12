@@ -91,6 +91,7 @@ export default function EnrollPerson() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, facingMode: "user" },
+        // video: { width: 1080, height: 720, facingMode: "user" },
         audio: false,
       });
       streamRef.current = stream;
@@ -183,9 +184,12 @@ export default function EnrollPerson() {
 
         {/* Person selector */}
         <div className="field">
-          <label className="field-label">Select Person</label>
+          <label className="field-label" htmlFor="selectPerson">
+            Select Person
+          </label>
           <select
             className="field-select"
+            id="selectPerson"
             value={selectedId}
             onChange={(e) => {
               setSelectedId(e.target.value ? Number(e.target.value) : "");
@@ -225,13 +229,18 @@ export default function EnrollPerson() {
             />
 
             {status === "idle" && (
-              <button className="btn btn-primary" onClick={startCamera}>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={startCamera}
+              >
                 Start Camera
               </button>
             )}
 
             {(status === "camera-ready" || status === "capturing") && (
               <button
+                type="button"
                 className="btn btn-capture"
                 onClick={capture}
                 disabled={status === "capturing"}
@@ -250,7 +259,11 @@ export default function EnrollPerson() {
               <div className="success-state">
                 <div className="success-icon">✓</div>
                 <p className="success-msg">Enrolled successfully!</p>
-                <button className="btn btn-secondary" onClick={reset}>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={reset}
+                >
                   Enroll Another
                 </button>
               </div>
