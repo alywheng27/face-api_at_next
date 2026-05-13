@@ -45,6 +45,7 @@ type EnrollStatus =
 export default function EnrollPerson() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const [people, setPeople] = useState<PersonOption[]>([]);
   const [selectedId, setSelectedId] = useState<number | "">("");
@@ -90,18 +91,78 @@ export default function EnrollPerson() {
   async function startCamera() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
+        // video: true,
         video: { width: 640, height: 480, facingMode: "user" },
         // video: { width: 1080, height: 720, facingMode: "user" },
         audio: false,
       });
       streamRef.current = stream;
       if (videoRef.current) videoRef.current.srcObject = stream;
+
+      // Make the canvas same size and in the same location as the video feed
+      if (!canvasRef.current) return;
+      const videoEl = videoRef.current;
+      if (!videoEl) return;
+      canvasRef.current.style.left = `${videoEl.offsetLeft}px`;
+      canvasRef.current.style.top = `${videoEl.offsetTop}px`;
+      canvasRef.current.height = videoEl.videoHeight;
+      canvasRef.current.width = videoEl.videoWidth;
+
+      // Facial detections with points
+      setInterval(async () => {
+        // get the video feed and give it to detectAllfaces method
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
+        if (!video || !canvas) return;
+
+        // Load models
+        // Pre-trained machine learning  for facial detection
+        const faceapi = getFaceApi();
+        let faceAIData = await faceapi
+          .detectAllFaces(video)
+          .withFaceLandmarks()
+          .withFaceDescriptors()
+          .withAgeAndGender()
+          .withFaceExpressions();
+        // console.log(faceAIData);
+
+        // We have ton of good facial detection data in faceAIData
+        // faceAIData is an array, one element for each face
+
+        // Draw on our face/canvas
+        // First, clear the canvas
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Draw bounding box
+        const displaySize = {
+          width: canvas.width,
+          height: canvas.height,
+        };
+
+        faceAIData = faceapi.resizeResults(faceAIData, displaySize);
+        faceapi.draw.drawDetections(canvas, faceAIData);
+      }, 200);
+
       setStatus("camera-ready");
     } catch {
       setStatus("error");
       setMessage("Camera access denied. Please allow camera permissions.");
     }
   }
+
+  const handleVideoMetadata = useCallback(() => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas) return;
+
+    // Set canvas internal resolution to match the camera stream
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    // console.log(canvas.width);
+    // console.log(canvas.height);
+  }, []);
 
   // ─── Capture and enroll ───────────────────────────────────────────────────────
   async function capture() {
@@ -219,55 +280,73 @@ export default function EnrollPerson() {
 
         {/* Camera area */}
         {selectedId !== "" && (
-          <div className="camera-area">
-            <video
-              ref={videoRef}
-              autoPlay
-              muted
-              playsInline
-              className={`enroll-video ${status === "camera-ready" || status === "capturing" ? "visible" : "hidden"}`}
-            />
+          <div>
+            <div className="camera-area">
+              <div style={{ position: "relative" }}>
+                <video
+                  ref={videoRef}
+                  // style={{ zIndex: 1, position: "absolute" }}
+                  autoPlay
+                  muted
+                  playsInline
+                  onLoadedMetadata={handleVideoMetadata}
+                  className={`enroll-video ${status === "camera-ready" || status === "capturing" ? "visible" : "hidden"}`}
+                />
+                <canvas
+                  ref={canvasRef}
+                  style={{
+                    position: "absolute",
+                    inset: 0 /* stretches to fill .video-container exactly */,
+                    width: "100%",
+                    height: "100%",
+                    transform: "scaleX(-1)" /* ← mirrors to match the video */,
+                    pointerEvents: "none",
+                    border: "1px solid red",
+                  }}
+                ></canvas>
+              </div>
 
-            {status === "idle" && (
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={startCamera}
-              >
-                Start Camera
-              </button>
-            )}
-
-            {(status === "camera-ready" || status === "capturing") && (
-              <button
-                type="button"
-                className="btn btn-capture"
-                onClick={capture}
-                disabled={status === "capturing"}
-              >
-                {status === "capturing" ? (
-                  <>
-                    <span className="spinner-sm" /> Processing…
-                  </>
-                ) : (
-                  "Capture Face"
-                )}
-              </button>
-            )}
-
-            {status === "success" && (
-              <div className="success-state">
-                <div className="success-icon">✓</div>
-                <p className="success-msg">Enrolled successfully!</p>
+              {status === "idle" && (
                 <button
                   type="button"
-                  className="btn btn-secondary"
-                  onClick={reset}
+                  className="btn btn-primary"
+                  onClick={startCamera}
                 >
-                  Enroll Another
+                  Start Camera
                 </button>
-              </div>
-            )}
+              )}
+
+              {(status === "camera-ready" || status === "capturing") && (
+                <button
+                  type="button"
+                  className="btn btn-capture"
+                  onClick={capture}
+                  disabled={status === "capturing"}
+                >
+                  {status === "capturing" ? (
+                    <>
+                      <span className="spinner-sm" /> Processing…
+                    </>
+                  ) : (
+                    "Capture Face"
+                  )}
+                </button>
+              )}
+
+              {status === "success" && (
+                <div className="success-state">
+                  <div className="success-icon">✓</div>
+                  <p className="success-msg">Enrolled successfully!</p>
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={reset}
+                  >
+                    Enroll Another
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         )}
 
