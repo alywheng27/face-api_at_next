@@ -25,24 +25,49 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { recordAttendance } from "@/actions/attendance";
 import { getFaceApi, loadModels } from "@/lib/faceapi";
-import type { DescriptorRecord, ScanResult } from "@/types";
+import type { AttendanceOutcome, DescriptorRecord, Person } from "@/types";
 
-const SCAN_INTERVAL_MS = 2000; // how often to scan (milliseconds)
+// const SCAN_INTERVAL_MS = 2000; // how often to scan (milliseconds)
+const SCAN_INTERVAL_MS = 200; // how often to scan (milliseconds)
 const MATCH_THRESHOLD = 0.5; // Euclidean distance threshold
 
 type Status = "loading-models" | "loading-descriptors" | "ready" | "error";
+
+// One entry in the results sidebar — either a matched person or an unknown face
+interface FaceResult {
+  label: string;
+  confidence: number;
+  person: Omit<Person, "face_descriptor"> | null;
+  attendance: AttendanceOutcome | null; // null = unknown face, no attendance
+}
+
+// Tracks attendance state per person in the current session
+interface AttendanceState {
+  morningDone: boolean;
+  afternoonDone: boolean;
+  lastOutcome: AttendanceOutcome | null;
+}
 
 export default function FaceScanner() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const matcherRef = useRef<import("face-api.js").FaceMatcher | null>(null);
   const scanningRef = useRef(false); // prevents overlapping scans
+  // Caches: person data + attendance state, keyed by DB person id (string)
+  const personCacheRef = useRef<Map<string, Omit<Person, "face_descriptor">>>(
+    new Map(),
+  );
+  const attendanceStateRef = useRef<Map<string, AttendanceState>>(new Map());
+  // Tracks in-flight attendance calls to prevent concurrent duplicates
+  const attendancePendingRef = useRef<Set<string>>(new Set());
 
   const [status, setStatus] = useState<Status>("loading-models");
-  const [result, setResult] = useState<ScanResult | null>(null);
   const [errorMsg, setErrorMsg] = useState<string>("");
   const [enrolledCount, setEnrolledCount] = useState(0);
+
+  const [faceResults, setFaceResults] = useState<FaceResult[]>([]);
 
   // ─── Step 1: Load models and build FaceMatcher ──────────────────────────────
   useEffect(() => {
@@ -102,6 +127,14 @@ export default function FaceScanner() {
           videoRef.current.srcObject = stream;
         }
 
+        if (!canvasRef.current) return;
+        const videoEl = videoRef.current;
+        if (!videoEl) return;
+        canvasRef.current.style.left = `${videoEl.offsetLeft}px`;
+        canvasRef.current.style.top = `${videoEl.offsetTop}px`;
+        canvasRef.current.height = videoEl.videoHeight;
+        canvasRef.current.width = videoEl.videoWidth;
+
         setStatus("ready");
       } catch (err: unknown) {
         if (!cancelled) {
@@ -127,6 +160,75 @@ export default function FaceScanner() {
     };
   }, []);
 
+  // ── Record attendance for a matched person (non-blocking) ────────────────────
+  // Called during the scan loop. Returns the updated AttendanceState.
+  const handleAttendance = useCallback(
+    async (personId: string): Promise<AttendanceState> => {
+      const existing = attendanceStateRef.current.get(personId);
+
+      // Fast-path: if both sessions are already done, skip the Server Action entirely
+      if (existing?.morningDone && existing?.afternoonDone) {
+        return existing;
+      }
+
+      // Prevent concurrent calls for the same person (can happen at 200ms intervals)
+      if (attendancePendingRef.current.has(personId)) {
+        return (
+          existing ?? {
+            morningDone: false,
+            afternoonDone: false,
+            lastOutcome: null,
+          }
+        );
+      }
+
+      attendancePendingRef.current.add(personId);
+
+      try {
+        const outcome = await recordAttendance(Number(personId));
+
+        const prev = attendanceStateRef.current.get(personId) ?? {
+          morningDone: false,
+          afternoonDone: false,
+          lastOutcome: null,
+        };
+
+        const next: AttendanceState = {
+          morningDone: prev.morningDone || outcome === "morning-recorded",
+          afternoonDone: prev.afternoonDone || outcome === "afternoon-recorded",
+          lastOutcome: outcome,
+        };
+
+        // "already-complete" means both are done
+        if (outcome === "already-complete") {
+          next.morningDone = true;
+          next.afternoonDone = true;
+        }
+
+        // "not-morning-yet" means both are done
+        if (outcome === "not-morning-yet") {
+          next.morningDone = false;
+          next.afternoonDone = true;
+        }
+
+        attendanceStateRef.current.set(personId, next);
+        return next;
+      } catch (err) {
+        console.error(`Attendance error for person ${personId}:`, err);
+        return (
+          existing ?? {
+            morningDone: false,
+            afternoonDone: false,
+            lastOutcome: null,
+          }
+        );
+      } finally {
+        attendancePendingRef.current.delete(personId);
+      }
+    },
+    [],
+  );
+
   // ─── Step 2: Scan loop ───────────────────────────────────────────────────────
   const scan = useCallback(async () => {
     // Guard: skip if not ready, no matcher, or already scanning
@@ -145,8 +247,8 @@ export default function FaceScanner() {
       const faceapi = getFaceApi();
 
       // Detect a single face and compute its descriptor
-      const detection = await faceapi
-        .detectSingleFace(
+      let detection = await faceapi
+        .detectAllFaces(
           videoRef.current,
           new faceapi.TinyFaceDetectorOptions({
             inputSize: 320,
@@ -154,44 +256,138 @@ export default function FaceScanner() {
           }),
         )
         .withFaceLandmarks()
-        .withFaceDescriptor();
+        .withFaceDescriptors();
 
       if (!detection) {
         // No face in frame — clear the result
-        setResult(null);
         return;
       }
+
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw bounding box
+      const displaySize = {
+        width: canvas.width,
+        height: canvas.height,
+      };
+
+      detection = faceapi.resizeResults(detection, displaySize);
+      faceapi.draw.drawDetections(canvas, detection);
+      faceapi.draw.drawFaceLandmarks(canvas, detection);
 
       // Compare the detected descriptor against all enrolled faces
-      const match = matcherRef.current.findBestMatch(detection.descriptor);
+      const matches = detection.map((d) =>
+        matcherRef.current!.findBestMatch(d.descriptor),
+      );
 
-      if (match.label === "unknown") {
-        setResult({ found: false });
-        return;
-      }
+      // Fetch person data only for matched faces we haven't cached yet
+      const uncachedIds = matches
+        .map((m) => m.label)
+        .filter(
+          (label) => label !== "unknown" && !personCacheRef.current.has(label),
+        );
 
-      // We have a match — fetch the full person record from MSSQL
-      const personRes = await fetch(`/api/person/${match.label}`);
-      if (!personRes.ok) {
-        setResult({ found: false });
-        return;
-      }
+      // Deduplicate (same person could appear twice in the same frame)
+      const uniqueUncached = [...new Set(uncachedIds)];
 
-      const person = await personRes.json();
-      const confidence = Math.round((1 - match.distance) * 100);
+      await Promise.all(
+        uniqueUncached.map(async (id) => {
+          try {
+            const r = await fetch(`/api/person/${id}`);
+            if (!r.ok) return;
+            const person: Omit<Person, "face_descriptor"> = await r.json();
+            personCacheRef.current.set(id, person);
+          } catch {
+            // Silently skip fetch errors — the face will show as unknown
+          }
+        }),
+      );
 
-      setResult({
-        found: true,
-        person,
-        distance: match.distance,
-        confidence,
+      // Record attendance + build results in parallel for all matched faces
+      const matchedIds = [
+        ...new Set(matches.map((m) => m.label).filter((l) => l !== "unknown")),
+      ];
+
+      // Fire attendance recording for all matched people simultaneously
+      const attendanceResults = await Promise.all(
+        matchedIds.map((id) => handleAttendance(id)),
+      );
+      const attendanceMap = new Map(
+        matchedIds.map((id, i) => [id, attendanceResults[i]]),
+      );
+
+      // ── Build results array and draw labels on canvas ───────────────────────
+      const results: FaceResult[] = [];
+
+      detection.forEach((det, i) => {
+        const match = matches[i];
+        const isUnknown = match.label === "unknown";
+        const person = isUnknown
+          ? null
+          : (personCacheRef.current.get(match.label) ?? null);
+        const attendance = isUnknown
+          ? null
+          : (attendanceMap.get(match.label)?.lastOutcome ?? null);
+        const confidence = Math.round((1 - match.distance) * 100);
+
+        results.push({ label: match.label, confidence, person, attendance });
+
+        // Draw name label above each bounding box
+        const box = det.detection.box.topRight;
+        const labelText = person ? person.name : "Unknown";
+        const confText = `${confidence}%`;
+        const padding = 6;
+        const fontSize = 13;
+
+        ctx.font = `600 ${fontSize}px "IBM Plex Mono", monospace`;
+        const nameWidth = ctx.measureText(labelText).width;
+        const confWidth = ctx.measureText(confText).width;
+        const bgWidth = Math.max(nameWidth, confWidth) + padding * 2;
+        const bgHeight = fontSize * 2 + padding * 3;
+        const bgX = box.x;
+        const bgY = box.y;
+        // const bgY        = box.y - bgHeight - 4;
+
+        // Label background
+        ctx.fillStyle = isUnknown
+          ? "rgba(245,158,11,0.85)"
+          : "rgba(34,197,94,0.85)";
+        ctx.fillRect(bgX, bgY, bgWidth, bgHeight);
+
+        // Name text
+        ctx.fillStyle = "#000";
+        ctx.fillText(labelText, bgX + padding, bgY + padding + fontSize);
+
+        // Confidence text
+        ctx.font = `400 ${fontSize - 1}px "IBM Plex Mono", monospace`;
+        ctx.fillStyle = isUnknown ? "#000" : "#003300";
+        ctx.fillText(
+          confText,
+          bgX + padding,
+          bgY + padding * 2 + fontSize * 2 - 2,
+        );
       });
+
+      setFaceResults(results);
     } catch (err) {
       console.error("Scan error:", err);
     } finally {
       scanningRef.current = false;
     }
-  }, [status]);
+  }, [status, handleAttendance]);
+
+  const handleVideoMetadata = useCallback(() => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas) return;
+
+    // Set canvas internal resolution to match the camera stream
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  }, []);
 
   // Run the scan on an interval
   useEffect(() => {
@@ -199,6 +395,10 @@ export default function FaceScanner() {
     const interval = setInterval(scan, SCAN_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [status, scan]);
+
+  // Separate matched and unknown for the sidebar
+  const matchedFaces = faceResults.filter((r) => r.person !== null);
+  const unknownCount = faceResults.filter((r) => r.person === null).length;
 
   // ─── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -231,10 +431,23 @@ export default function FaceScanner() {
           autoPlay
           muted
           playsInline
+          onLoadedMetadata={handleVideoMetadata}
           className="camera-feed"
         />
         {/* Hidden canvas used to draw frames for processing */}
-        <canvas ref={canvasRef} style={{ display: "none" }} />
+        <canvas
+          ref={canvasRef}
+          style={{
+            position: "absolute",
+            inset: 0 /* stretches to fill .video-container exactly */,
+            width: "100%",
+            height: "100%",
+            // transform: "scaleX(-1)" /* ← mirrors to match the video */,
+            pointerEvents: "none",
+            border: "1px solid red",
+          }}
+          // style={{ display: "none" }}
+        />
 
         {/* Live scan indicator */}
         {status === "ready" && (
@@ -245,67 +458,120 @@ export default function FaceScanner() {
         )}
 
         {/* Face detection frame overlay */}
-        {status === "ready" && result && (
+        {/* {status === "ready" && result && (
           <div
             className={`face-frame ${result.found ? "matched" : "unknown"}`}
           />
+        )} */}
+
+        {/* Live face count badge */}
+        {faceResults.length > 0 && (
+          <div className="face-count-badge">
+            {faceResults.length} face{faceResults.length !== 1 ? "s" : ""}{" "}
+            detected
+          </div>
         )}
       </div>
 
-      {/* Result card */}
-      {result?.found && result.person && (
-        <div className="result-card">
-          <div className="result-header">
-            <div className="avatar">
-              {result.person.name.charAt(0).toUpperCase()}
-            </div>
-            <div className="result-info">
-              <h2 className="result-name">{result.person.name}</h2>
-              {result.person.position && (
-                <p className="result-position">{result.person.position}</p>
-              )}
-              {result.person.department && (
-                <p className="result-department">{result.person.department}</p>
-              )}
-            </div>
+      <div className="results-panel">
+        {/* No faces in frame */}
+        {status === "ready" && faceResults.length === 0 && (
+          <div className="results-empty">
+            <span className="results-empty-icon">◎</span>
+            <p>No faces in frame</p>
+            <span>Point the camera at people to identify them</span>
           </div>
+        )}
 
-          <div className="result-details">
-            {result.person.email && (
-              <div className="detail-row">
-                <span className="detail-label">Email</span>
-                <span className="detail-value">{result.person.email}</span>
+        {/* Matched people cards */}
+        {matchedFaces.map((r, i) => {
+          const attState = attendanceStateRef.current.get(r.label);
+
+          return (
+            <div key={`${r.label}-${i}`} className="result-card">
+              <div className="result-header">
+                <div className="avatar">
+                  {r.person!.name.charAt(0).toUpperCase()}
+                </div>
+                <div className="result-info">
+                  <h2 className="result-name">{r.person!.name}</h2>
+                  {r.person!.position && (
+                    <p className="result-position">{r.person!.position}</p>
+                  )}
+                  {r.person!.department && (
+                    <p className="result-department">{r.person!.department}</p>
+                  )}
+                </div>
               </div>
-            )}
-            {result.person.phone && (
-              <div className="detail-row">
-                <span className="detail-label">Phone</span>
-                <span className="detail-value">{result.person.phone}</span>
+
+              {/* Attendance badges */}
+              <div className="attendance-badges">
+                <span
+                  className={`att-badge ${attState?.morningDone ? "att-done" : "att-pending"}`}
+                >
+                  {attState?.morningDone ? "☀ Morning ✓" : "☀ Morning —"}
+                </span>
+                <span
+                  className={`att-badge ${attState?.afternoonDone ? "att-done" : "att-pending"}`}
+                >
+                  {attState?.afternoonDone ? "◑ Afternoon ✓" : "◑ Afternoon —"}
+                </span>
               </div>
-            )}
-          </div>
 
-          <div className="confidence-bar">
-            <div className="confidence-label">
-              Match confidence
-              <strong>{result.confidence}%</strong>
-            </div>
-            <div className="confidence-track">
-              <div
-                className="confidence-fill"
-                style={{ width: `${result.confidence}%` }}
-              />
-            </div>
-          </div>
-        </div>
-      )}
+              {/* Flash message for just-recorded attendance */}
+              {(r.attendance === "morning-recorded" ||
+                r.attendance === "afternoon-recorded") && (
+                <div className="att-flash">
+                  ✓{" "}
+                  {r.attendance === "morning-recorded"
+                    ? "Morning"
+                    : "Afternoon"}{" "}
+                  attendance recorded
+                </div>
+              )}
 
-      {result && !result.found && (
-        <div className="result-card unknown">
-          <span className="unknown-icon">?</span>
-          <p>Face detected — no match in database</p>
-        </div>
-      )}
+              <div className="result-details">
+                {r.person!.email && (
+                  <div className="detail-row">
+                    <span className="detail-label">Email</span>
+                    <span className="detail-value">{r.person!.email}</span>
+                  </div>
+                )}
+                {r.person!.phone && (
+                  <div className="detail-row">
+                    <span className="detail-label">Phone</span>
+                    <span className="detail-value">{r.person!.phone}</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="confidence-bar">
+                <div className="confidence-label">
+                  Match confidence <strong>{r.confidence}%</strong>
+                </div>
+                <div className="confidence-track">
+                  <div
+                    className="confidence-fill"
+                    style={{ width: `${r.confidence}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          );
+        })}
+
+        {/* Unknown faces summary — one compact row instead of a card per face */}
+        {unknownCount > 0 && (
+          <div className="result-card unknown">
+            <span className="unknown-icon">?</span>
+            <p>
+              {unknownCount} unknown face{unknownCount !== 1 ? "s" : ""}{" "}
+              detected
+            </p>
+            <span className="unknown-hint">Not in the enrolled database</span>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
